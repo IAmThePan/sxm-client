@@ -1,15 +1,40 @@
 """HTTP Server module for sxm"""
 import json
 import logging
+import re
 from asyncio import get_event_loop, sleep
 from time import monotonic
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from aiohttp import web
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from sxm.client import HLS_AES_KEY, SegmentRetrievalException, SXMClient, SXMClientAsync
 
 __all__ = ["make_http_handler", "run_http_server"]
+
+
+def _hls_decrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
+    """Decrypt AES-128-CBC and strip PKCS7 padding."""
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    decrypted = decryptor.update(data) + decryptor.finalize()
+    pad_len = decrypted[-1]
+    if 1 <= pad_len <= 16:
+        decrypted = decrypted[:-pad_len]
+    return decrypted
+
+
+def _find_adts(data: bytes) -> int:
+    """Find first validated ADTS sync word offset. Returns 0 if not found."""
+    for i in range(min(len(data) - 7, 1024)):
+        if data[i] == 0xFF and (data[i + 1] & 0xF0) == 0xF0:
+            frame_len = ((data[i + 3] & 0x03) << 11) | (data[i + 4] << 3) | ((data[i + 5] & 0xE0) >> 5)
+            if 100 <= frame_len <= 5000 and i + frame_len + 2 <= len(data):
+                nxt = i + frame_len
+                if data[nxt] == 0xFF and (data[nxt + 1] & 0xF0) == 0xF0:
+                    return i
+    return 0
 
 
 def make_http_handler(
@@ -130,6 +155,67 @@ def make_http_handler(
                 )
             else:
                 response = web.Response(status=503)
+        elif request.path.endswith(".stream"):
+            channel_id = request.path.rsplit("/", 1)[1][:-7]
+
+            def _parse_seq(playlist_text: str) -> int:
+                m = re.search(r"#EXT-X-MEDIA-SEQUENCE:(\d+)", playlist_text)
+                return int(m.group(1)) if m else 0
+
+            def _prepare_segment(data: bytes, seq: int) -> bytes:
+                iv = seq.to_bytes(16, "big")
+                dec = _hls_decrypt(data, HLS_AES_KEY, iv)
+                offset = _find_adts(dec)
+                return dec[offset:] if offset else dec
+
+            response = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "audio/aac",
+                },
+            )
+            await response.prepare(request)
+
+            last_sent_seq: Optional[int] = None
+
+            try:
+                while True:
+                    playlist = await get_playlist(channel_id)
+                    if playlist is None:
+                        await sleep(0.5)
+                        continue
+
+                    seq = _parse_seq(playlist)
+                    sent = False
+                    for line in playlist.split("\n"):
+                        line = line.strip()
+                        if not line.endswith(".aac"):
+                            continue
+
+                        # Only send segments we haven't sent yet to avoid
+                        # replaying audio when the playlist overlaps with
+                        # the previous fetch (the server sends faster than
+                        # real-time playback speed).
+                        if last_sent_seq is not None and seq <= last_sent_seq:
+                            seq += 1
+                            continue
+
+                        data = await get_segment(line)
+                        if data is None:
+                            seq += 1
+                            continue
+
+                        data = _prepare_segment(data, seq)
+                        await response.write(data)
+                        last_sent_seq = seq
+                        seq += 1
+                        sent = True
+
+                    await sleep(0.5 if sent else 8)
+            except (ConnectionResetError, ConnectionAbortedError):
+                pass
+
+            return response
         elif request.path.endswith("/key/1"):
             response = web.Response(
                 status=200,
