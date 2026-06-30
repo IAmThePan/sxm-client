@@ -2,6 +2,17 @@
 History
 =======
 
+0.3.0 (unreleased)
+------------------
+
+* Adds ``.stream`` endpoint that decrypts HLS segments and serves raw AAC
+  as an uninterrupted stream — compatible with players that don't support
+  native HLS (e.g. moOde Audio multi-room)
+* Fixes duplicate-segment replay in ``.stream`` endpoint by tracking sent
+  media sequence numbers (``last_sent_seq``) to skip already-delivered segments
+* Adds adaptive polling: sleeps 8s when caught up to the live edge, 0.5s
+  when new segments are available, reducing idle HTTP overhead by ~90%
+
 0.2.8 (2021-07-24)
 ------------------
 

@@ -41,6 +41,8 @@ Features
 --------
 
 * A simple HTTP Proxy server that can serve HLS streams for sxm-client channels
+* A ``.stream`` endpoint that decrypts HLS segments and serves raw continuous AAC —
+  compatible with players that don't support native HLS (e.g. moOde Audio multi-room)
 * Python sxm Client
 * Python classes for interface with sxm channel data
 
